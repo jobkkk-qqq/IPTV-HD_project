@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# 使用国内镜像加速 apt（宿主机可用 mirrors.zju.edu.cn）
+# 国内镜像加速 apt
 RUN sed -i 's|http://deb.debian.org|http://mirrors.zju.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
@@ -9,8 +9,10 @@ RUN sed -i 's|http://deb.debian.org|http://mirrors.zju.edu.cn|g' /etc/apt/source
 WORKDIR /app
 
 COPY docker/server.py /app/server.py
+COPY docker/entrypoint.sh /app/entrypoint.sh
 COPY scripts/ /scripts/
-RUN chmod +x /scripts/*.sh
+RUN chmod +x /scripts/*.sh /app/entrypoint.sh
 
 EXPOSE 3568
-CMD ["python3", "/app/server.py"]
+
+ENTRYPOINT ["/app/entrypoint.sh"]

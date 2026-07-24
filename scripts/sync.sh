@@ -11,7 +11,7 @@ LOG="${CACHE_DIR}/sync-hd.log"
 
 echo "=== IPTV HD Sync $(date '+%Y-%m-%d %H:%M:%S') ===" | tee -a "$LOG"
 
-# Step 1: Download source (用 Python urllib，容器内零额外依赖)
+# Step 1: Download source
 echo "[1/4] Downloading source..." | tee -a "$LOG"
 python3 -c "
 import urllib.request, sys
@@ -32,7 +32,7 @@ SRC=$(grep -c "#EXTINF" "${CACHE_DIR}/source.m3u" 2>/dev/null || echo 0)
 echo "  Source: ${SRC} entries" | tee -a "$LOG"
 [ "$SRC" -lt 100 ] && echo "ERROR: too few channels (${SRC})" | tee -a "$LOG" && exit 1
 
-# Step 2: Copy source directly (no pre-filter)
+# Step 2: Copy source directly
 echo "[2/4] Using all sources (no pre-filter)..." | tee -a "$LOG"
 cp "${CACHE_DIR}/source.m3u" "${CACHE_DIR}/result.m3u"
 
@@ -40,7 +40,7 @@ cp "${CACHE_DIR}/source.m3u" "${CACHE_DIR}/result.m3u"
 echo "[3/4] ffprobe resolution check (parallel, 15s timeout)..." | tee -a "$LOG"
 CACHE_DIR="$CACHE_DIR" python3 /scripts/probe_hd.py 2>&1 | tee -a "$LOG"
 
-# Step 4: Format using standard template
+# Step 4: Format
 echo "[4/4] Format using standard template..." | tee -a "$LOG"
 python3 /scripts/iptv_format.py \
   "${CACHE_DIR}/result_hd.m3u" \
