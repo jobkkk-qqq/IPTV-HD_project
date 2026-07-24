@@ -1,159 +1,221 @@
 #!/usr/bin/env python3
 """
-IPTV M3U 格式标准化模板
-用法: python3 iptv_format.py <输入.m3u> [输出.m3u] [输出.txt]
-  默认输出: result_clean.m3u + result_clean.txt
-
-将任何 M3U 格式化为统一风格:
-  - 头部: #EXTM3U x-tvg-url="http://192.168.1.111:PORT/playback.xml" catchup=...
-  - 分组: 去除 emoji 图标 (📺央视→央视, ☘️广东→广东 等)
-  - 去重: 同名频道只保留第一个
-  - 双输出: M3U + TXT (Diyp/百川格式)
+IPTV M3U 格式标准化
+- 替换为 3566 同款干净文件头（含 catchup）
+- 去 emoji 分组
+- 去重：同名同组只保留第一个
+- 移除 🕘️更新时间 垃圾条目
+- 双输出：M3U + TXT
 """
+import re
+import os
+import sys
 
-import re, sys, os as _os
-from collections import Counter
+DATA_DIR = "/novel/DATA/AppData/iptv-hd/data"
+SERVER_IP = "192.168.1.111"
+PORT = "3568"
 
-# ========== 配置区：改这里 ==========
-# 可通过环境变量覆盖
-PORT = _os.environ.get('IPTV_PORT', "3568")
-SERVER_IP = _os.environ.get('IPTV_SERVER_IP', "localhost")
-_BASE = _os.environ.get('CACHE_DIR', '/data')
-# ===================================
-
-# Emoji → 干净分组的映射表
-EMOJI_CLEAN = {
-    "📺央视频道": "央视",     "📡卫视频道": "卫视",
-    "💰央视付费频道": "付费", "☘️广东频道": "广东",
-    "☘️浙江频道": "浙江",     "☘️北京频道": "北京",
-    "☘️上海频道": "上海",     "☘️江苏频道": "江苏",
-    "☘️陕西频道": "陕西",     "☘️河南频道": "河南",
-    "☘️海南频道": "海南",     "☘️广西频道": "广西",
-    "☘️福建频道": "福建",     "☘️湖南频道": "湖南",
-    "☘️山东频道": "山东",     "☘️山西频道": "山西",
-    "☘️安徽频道": "安徽",     "☘️黑龙江频道": "黑龙江",
-    "☘️新疆频道": "新疆",     "🌊港·澳·台": "港澳台",
-    "🎬电影频道": "电影",     "🎮游戏频道": "游戏",
-    "🎵音乐频道": "音乐",     "🏀体育频道": "体育",
-    "🏛经典剧场": "剧场",     "🪁动画频道": "动画",
+# emoji → 中文分组映射
+GROUP_MAP = {
+    "📺央视频道": "央视",
+    "📡卫视频道": "卫视",
+    "💰央视付费频道": "付费",
+    "☘️广东频道": "广东",
+    "☘️浙江频道": "浙江",
+    "☘️北京频道": "北京",
+    "☘️上海频道": "上海",
+    "☘️江苏频道": "江苏",
+    "☘️山东频道": "山东",
+    "☘️陕西频道": "陕西",
+    "☘️河南频道": "河南",
+    "☘️海南频道": "海南",
+    "☘️广西频道": "广西",
+    "☘️福建频道": "福建",
+    "☘️湖南频道": "湖南",
+    "☘️湖北频道": "湖北",
+    "☘️四川频道": "四川",
+    "☘️重庆频道": "重庆",
+    "☘️天津频道": "天津",
+    "☘️河北频道": "河北",
+    "☘️山西频道": "山西",
+    "☘️辽宁频道": "辽宁",
+    "☘️吉林频道": "吉林",
+    "☘️黑龙江频道": "黑龙江",
+    "☘️安徽频道": "安徽",
+    "☘️江西频道": "江西",
+    "☘️云南频道": "云南",
+    "☘️贵州频道": "贵州",
+    "☘️甘肃频道": "甘肃",
+    "☘️青海频道": "青海",
+    "☘️宁夏频道": "宁夏",
+    "☘️内蒙古频道": "内蒙古",
+    "☘️新疆频道": "新疆",
+    "☘️西藏频道": "西藏",
+    "🌊港·澳·台": "港澳台",
+    "🎬电影频道": "电影",
+    "🏀体育频道": "体育",
+    "🎵音乐频道": "音乐",
+    "🎮游戏频道": "游戏",
+    "🪁动画频道": "动画",
+    "🏛经典剧场": "剧场",
+    "🕘️更新时间": None,  # 移除该组
 }
 
-def clean_group_name(name):
-    """清理分组名: 去除 emoji"""
-    if name in EMOJI_CLEAN:
-        return EMOJI_CLEAN[name]
-    # 兜底: 用正则去除所有 emoji
-    cleaned = re.sub(
-        r'[\U0001F300-\U0001FAFF\U0001F600-\U0001F64F'
-        r'\U0001F680-\U0001F6FF\u2600-\u27BF'
-        r'\U0000FE00-\U0000FE0F\u00A9\u00AE'
-        r'☘️💰🌊🎬🎮🎵🏀🏛🪁]', '', name
-    ).strip()
-    return cleaned if cleaned else name
+# 3566 同款文件头
+M3U_HEADER = (
+    '#EXTM3U '
+    f'x-tvg-url="http://{SERVER_IP}:{PORT}/playback.xml" '
+    'catchup="append" '
+    'catchup-source="?playbackbegin=${(b)yyyyMMddHHmmss}&playbackend=${(e)yyyyMMddHHmmss}"'
+)
 
+def clean_group(group_title):
+    """将 emoji 分组名转为中文"""
+    for emoji_name, clean_name in GROUP_MAP.items():
+        if emoji_name == group_title:
+            return clean_name
+    # 尝试部分匹配
+    for emoji_name, clean_name in GROUP_MAP.items():
+        if emoji_name in group_title or group_title in emoji_name:
+            return clean_name
+    return group_title
 
-def parse_m3u(filepath):
-    """解析 M3U 文件, 返回 [(extinf, url), ...]"""
+def parse_m3u(content):
+    """解析 M3U，返回 (header_line, list of (extinf, url))"""
+    lines = content.strip().split('\n')
+    header = lines[0] if lines[0].startswith('#EXTM3U') else M3U_HEADER
+
     entries = []
-    cur = None
-    with open(filepath, encoding='utf-8') as f:
-        for line in f:
-            line = line.rstrip('\n\r')
-            if line.startswith('#EXTINF:'):
-                cur = line
-            elif line.startswith('http') and cur:
-                entries.append((cur, line))
-                cur = None
-    return entries
+    i = 1 if lines[0].startswith('#EXTM3U') else 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith('#EXTINF'):
+            extinf = line
+            if i + 1 < len(lines):
+                url = lines[i + 1].strip()
+                entries.append((extinf, url))
+                i += 2
+                continue
+        i += 1
+    return header, entries
 
-
-def format_entries(entries):
-    """
-    标准化处理:
-    1. 去除 emoji 分组名
-    2. 同名频道去重 (保留第一个)
-    3. 保留 tvg-id, tvg-name, tvg-logo
-    """
+def deduplicate(entries):
+    """去重：同名同组只保留第一个"""
     seen = set()
-    output = []
-
+    result = []
     for extinf, url in entries:
-        name = extinf.split(",")[-1].strip() if "," in extinf else ""
-        if not name or name in seen:
+        # 提取 tvg-name 和 group-title
+        name_m = re.search(r'tvg-name="([^"]*)"', extinf)
+        group_m = re.search(r'group-title="([^"]*)"', extinf)
+        name = name_m.group(1) if name_m else ""
+        group = group_m.group(1) if group_m else ""
+        key = (name, group)
+        if key not in seen:
+            seen.add(key)
+            result.append((extinf, url))
+    return result
+
+def filter_clean(entries):
+    """移除垃圾条目（🕘️更新时间组、空名称等）"""
+    result = []
+    for extinf, url in entries:
+        group_m = re.search(r'group-title="([^"]*)"', extinf)
+        group = group_m.group(1) if group_m else ""
+        name_m = re.search(r'tvg-name="([^"]*)"', extinf)
+        name = name_m.group(1) if name_m else ""
+
+        # 移除更新时间组
+        if '更新时间' in group or '更新' in name:
             continue
-        seen.add(name)
+        # 移除空名称
+        if not name.strip():
+            continue
+        # 移除纯日期作为名称的
+        if re.match(r'^\d{4}-\d{2}-\d{2}', name):
+            continue
+        result.append((extinf, url))
+    return result
 
-        # 提取字段
-        tid = (re.search(r'tvg-id="([^"]*)"', extinf) or [None, name]).group(1)
-        tvg_name = (re.search(r'tvg-name="([^"]*)"', extinf) or [None, name]).group(1)
-        logo = (re.search(r'tvg-logo="([^"]*)"', extinf) or [None, ""]).group(1)
-        grp = clean_group_name(
-            (re.search(r'group-title="([^"]*)"', extinf) or [None, "其他"]).group(1)
-        )
+def clean_extinf(extinf):
+    """清理 EXTINF 行：替换 emoji 分组名"""
+    def replace_group(m):
+        old = m.group(1)
+        new = clean_group(old)
+        if new is None:
+            return f'group-title="__REMOVE__"'
+        return f'group-title="{new}"'
 
-        output.append((tid, tvg_name, logo, grp, name, url))
+    extinf = re.sub(r'group-title="([^"]*)"', replace_group, extinf)
+    return extinf
 
-    return output
-
-
-def build_m3u(output, port=PORT, ip=SERVER_IP):
-    """生成 3566 风格 M3U 内容"""
-    header = (
-        f'#EXTM3U x-tvg-url="http://{ip}:{port}/playback.xml"'
-        f' catchup="append"'
-        f' catchup-source="?playbackbegin=${{(b)yyyyMMddHHmmss}}'
-        f'&playbackend=${{(e)yyyyMMddHHmmss}}"\n'
-    )
+def build_m3u(header, entries):
+    """生成 M3U 内容"""
     lines = [header]
-    for tid, tname, logo, grp, cname, url in output:
-        lines.append(
-            f'#EXTINF:-1 tvg-id="{tid}" tvg-name="{tname}"'
-            f' tvg-logo="{logo}" group-title="{grp}",{cname}'
-        )
+    for extinf, url in entries:
+        extinf_clean = clean_extinf(extinf)
+        if '__REMOVE__' in extinf_clean:
+            continue
+        lines.append(extinf_clean)
         lines.append(url)
-        lines.append("")
-    return "\n".join(lines).rstrip("\n") + "\n"
+    return '\n'.join(lines)
 
-
-def build_txt(output):
-    """生成 Diyp/百川 格式 TXT 内容"""
-    return "\n".join(f"{cname},{url}" for *_, cname, url in output) + "\n"
-
+def build_txt(entries):
+    """生成 TXT 内容（Diyp/百川格式: 频道名,url）"""
+    lines = []
+    for extinf, url in entries:
+        name_m = re.search(r'group-title="([^"]*)"', extinf)
+        display_m = re.search(r',([^,]*)$', extinf)
+        group = name_m.group(1) if name_m else ""
+        display = display_m.group(1).strip() if display_m else ""
+        group_clean = clean_group(group)
+        if group_clean is None:
+            continue
+        lines.append(f"{display},{url}")
+    return '\n'.join(lines)
 
 def main():
-    # 解析参数
-    input_file = sys.argv[1] if len(sys.argv) > 1 else f"{_BASE}/result_hd.m3u"
-    output_m3u = sys.argv[2] if len(sys.argv) > 2 else f"{_BASE}/result.m3u"
-    output_txt = sys.argv[3] if len(sys.argv) > 3 else f"{_BASE}/result.txt"
-
-    if not os.path.exists(input_file):
-        print(f"❌ 输入文件不存在: {input_file}")
+    # 支持 CLI 参数: python3 iptv_format.py [input.m3u]
+    if len(sys.argv) > 1:
+        input_path = sys.argv[1]
+    else:
+        input_path = os.path.join(DATA_DIR, "result_hd.m3u")
+        if not os.path.exists(input_path):
+            input_path = os.path.join(DATA_DIR, "result.m3u")
+    if not os.path.exists(input_path):
+        print(f"输入文件不存在: result_hd.m3u / result.m3u")
         sys.exit(1)
 
-    # 解析 → 格式化
-    entries = parse_m3u(input_file)
-    print(f"解析: {len(entries)} 条")
+    print(f"读取: {input_path}")
+    with open(input_path, 'r', encoding='utf-8') as f:
+        content = f.read()
 
-    output = format_entries(entries)
-    print(f"格式化 (去重后): {len(output)} 个频道")
+    header, entries = parse_m3u(content)
+    print(f"解析到 {len(entries)} 条")
 
-    # 写 M3U
-    m3u_content = build_m3u(output)
-    with open(output_m3u, 'w', encoding='utf-8') as f:
+    entries = filter_clean(entries)
+    print(f"过滤后: {len(entries)} 条")
+
+    entries = deduplicate(entries)
+    print(f"去重后: {len(entries)} 条")
+
+    # 用 3566 同款文件头
+    header = M3U_HEADER
+
+    # 输出 M3U
+    m3u_path = os.path.join(DATA_DIR, "result.m3u")
+    m3u_content = build_m3u(header, entries)
+    with open(m3u_path, 'w', encoding='utf-8') as f:
         f.write(m3u_content)
-    print(f"✅ M3U: {output_m3u}")
+    print(f"M3U 输出: {m3u_path} ({len(entries)} 条, {len(m3u_content)} bytes)")
 
-    # 写 TXT
-    txt_content = build_txt(output)
-    with open(output_txt, 'w', encoding='utf-8') as f:
+    # 输出 TXT
+    txt_path = os.path.join(DATA_DIR, "result.txt")
+    txt_content = build_txt(entries)
+    with open(txt_path, 'w', encoding='utf-8') as f:
         f.write(txt_content)
-    print(f"✅ TXT: {output_txt}")
+    print(f"TXT 输出: {txt_path} ({len(txt_content)} bytes)")
 
-    # 统计分组
-    groups = Counter(g for *_, g, _, _ in output)
-    print(f"\n分组 ({len(groups)}):")
-    for g, c in sorted(groups.items()):
-        print(f"  {g}: {c}")
+    print("完成！")
 
 
 if __name__ == '__main__':
