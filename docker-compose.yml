@@ -1,0 +1,9 @@
+services:
+  iptv-hd:
+    build: .
+    container_name: iptv-hd
+    ports:
+      - "3568:3568"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

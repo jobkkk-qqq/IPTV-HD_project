@@ -1,0 +1,14 @@
+# 运行时数据
+data/
+*.pyc
+__pycache__/
+connect_cache.json
+resolution_cache.json
+tested_urls.json
+
+# 日志
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db
