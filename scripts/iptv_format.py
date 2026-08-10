@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
-IPTV M3U 格式标准化
+IPTV M3U 格式标准化（双环境兼容版）
 - 替换为 3566 同款干净文件头（含 catchup）
 - 去 emoji 分组
 - 去重：同名同组只保留第一个
 - 移除 🕘️更新时间 垃圾条目
 - 双输出：M3U + TXT
+
+用法（三参数，兼容 sync.sh 的调用方式）:
+  python3 iptv_format.py <input.m3u> [output.m3u] [output.txt]
+无参数时默认从 DATA_DIR 读 result_hd.m3u → result.m3u/result.txt
+
+路径解析：
+- 容器内（CACHE_DIR=/data）：路径以 /data 为准
+- 宿主机（无 CACHE_DIR）：默认 /novel/DATA/AppData/iptv-hd/data
+- 显式传入的参数优先，绝不硬编码覆盖
 """
 import re
 import os
 import sys
 
-DATA_DIR = "/novel/DATA/AppData/iptv-hd/data"
-SERVER_IP = "192.168.1.111"
-PORT = "3568"
+# 双环境路径：CACHE_DIR 环境变量优先（容器内 sync.sh 设置），否则宿主机默认
+BASE_DIR = os.environ.get("CACHE_DIR", "/novel/DATA/AppData/iptv-hd/data")
+SERVER_IP = os.environ.get("IPTV_SERVER_IP", "192.168.1.111")
+PORT = os.environ.get("IPTV_PORT", "3568")
 
 # emoji → 中文分组映射
 GROUP_MAP = {
@@ -69,6 +79,7 @@ M3U_HEADER = (
     'catchup-source="?playbackbegin=${(b)yyyyMMddHHmmss}&playbackend=${(e)yyyyMMddHHmmss}"'
 )
 
+
 def clean_group(group_title):
     """将 emoji 分组名转为中文"""
     for emoji_name, clean_name in GROUP_MAP.items():
@@ -79,6 +90,7 @@ def clean_group(group_title):
         if emoji_name in group_title or group_title in emoji_name:
             return clean_name
     return group_title
+
 
 def parse_m3u(content):
     """解析 M3U，返回 (header_line, list of (extinf, url))"""
@@ -99,6 +111,7 @@ def parse_m3u(content):
         i += 1
     return header, entries
 
+
 def deduplicate(entries):
     """去重：同名同组只保留第一个"""
     seen = set()
@@ -114,6 +127,7 @@ def deduplicate(entries):
             seen.add(key)
             result.append((extinf, url))
     return result
+
 
 def filter_clean(entries):
     """移除垃圾条目（🕘️更新时间组、空名称等）"""
@@ -136,17 +150,19 @@ def filter_clean(entries):
         result.append((extinf, url))
     return result
 
+
 def clean_extinf(extinf):
     """清理 EXTINF 行：替换 emoji 分组名"""
     def replace_group(m):
         old = m.group(1)
         new = clean_group(old)
         if new is None:
-            return f'group-title="__REMOVE__"'
+            return 'group-title="__REMOVE__"'
         return f'group-title="{new}"'
 
     extinf = re.sub(r'group-title="([^"]*)"', replace_group, extinf)
     return extinf
+
 
 def build_m3u(header, entries):
     """生成 M3U 内容"""
@@ -158,6 +174,7 @@ def build_m3u(header, entries):
         lines.append(extinf_clean)
         lines.append(url)
     return '\n'.join(lines)
+
 
 def build_txt(entries):
     """生成 TXT 内容（Diyp/百川格式: 频道名,url）"""
@@ -173,16 +190,28 @@ def build_txt(entries):
         lines.append(f"{display},{url}")
     return '\n'.join(lines)
 
+
 def main():
-    # 支持 CLI 参数: python3 iptv_format.py [input.m3u]
-    if len(sys.argv) > 1:
+    # 三参数兼容：input [output.m3u] [output.txt]（sync.sh 就是这么调的）
+    if len(sys.argv) >= 2:
         input_path = sys.argv[1]
     else:
-        input_path = os.path.join(DATA_DIR, "result_hd.m3u")
+        input_path = os.path.join(BASE_DIR, "result_hd.m3u")
         if not os.path.exists(input_path):
-            input_path = os.path.join(DATA_DIR, "result.m3u")
+            input_path = os.path.join(BASE_DIR, "result.m3u")
+
+    if len(sys.argv) >= 3:
+        m3u_path = sys.argv[2]
+    else:
+        m3u_path = os.path.join(BASE_DIR, "result.m3u")
+
+    if len(sys.argv) >= 4:
+        txt_path = sys.argv[3]
+    else:
+        txt_path = os.path.join(BASE_DIR, "result.txt")
+
     if not os.path.exists(input_path):
-        print(f"输入文件不存在: result_hd.m3u / result.m3u")
+        print(f"输入文件不存在: {input_path}")
         sys.exit(1)
 
     print(f"读取: {input_path}")
@@ -202,14 +231,12 @@ def main():
     header = M3U_HEADER
 
     # 输出 M3U
-    m3u_path = os.path.join(DATA_DIR, "result.m3u")
     m3u_content = build_m3u(header, entries)
     with open(m3u_path, 'w', encoding='utf-8') as f:
         f.write(m3u_content)
     print(f"M3U 输出: {m3u_path} ({len(entries)} 条, {len(m3u_content)} bytes)")
 
     # 输出 TXT
-    txt_path = os.path.join(DATA_DIR, "result.txt")
     txt_content = build_txt(entries)
     with open(txt_path, 'w', encoding='utf-8') as f:
         f.write(txt_content)

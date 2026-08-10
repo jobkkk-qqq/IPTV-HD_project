@@ -159,11 +159,11 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
 with open(CACHE_FILE, 'w') as f:
     json.dump(cache, f)
 
-# Filter ≥1080p
+# Filter ≥1080p (必须 method==ffprobe 实测，防旧缓存假 1080)
 kept = []
 for extinf, url in entries:
     result = cache.get(url, {})
-    if result.get("height", 0) >= 1080:
+    if isinstance(result, dict) and result.get("method") == "ffprobe" and result.get("height", 0) >= 1080:
         kept.append((extinf, url))
 
 # Deduplicate by channel name

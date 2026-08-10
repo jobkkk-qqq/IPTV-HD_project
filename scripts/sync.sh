@@ -32,9 +32,9 @@ SRC=$(grep -c "#EXTINF" "${CACHE_DIR}/source.m3u" 2>/dev/null || echo 0)
 echo "  Source: ${SRC} entries" | tee -a "$LOG"
 [ "$SRC" -lt 100 ] && echo "ERROR: too few channels (${SRC})" | tee -a "$LOG" && exit 1
 
-# Step 2: Copy source directly
-echo "[2/4] Using all sources (no pre-filter)..." | tee -a "$LOG"
-cp "${CACHE_DIR}/source.m3u" "${CACHE_DIR}/result.m3u"
+# Step 2: Backup source only (绝不覆盖 result.m3u — 防止 Step 4 失败时服务器喂原始源)
+echo "[2/4] Backing up source (result.m3u untouched)..." | tee -a "$LOG"
+cp "${CACHE_DIR}/source.m3u" "${CACHE_DIR}/source.bak"
 
 # Step 3: ffprobe HD detection
 echo "[3/4] ffprobe resolution check (parallel, 15s timeout)..." | tee -a "$LOG"
