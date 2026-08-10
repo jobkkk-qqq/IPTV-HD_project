@@ -177,16 +177,21 @@ def build_m3u(header, entries):
 
 
 def build_txt(entries):
-    """生成 TXT 内容（Diyp/百川格式: 频道名,url）"""
+    """生成 TXT 内容（Diyp/百川格式: 分组名,#genre# + 频道名,url）"""
     lines = []
+    current_group = None
     for extinf, url in entries:
-        name_m = re.search(r'group-title="([^"]*)"', extinf)
+        group_m = re.search(r'group-title="([^"]*)"', extinf)
         display_m = re.search(r',([^,]*)$', extinf)
-        group = name_m.group(1) if name_m else ""
+        group = group_m.group(1) if group_m else ""
         display = display_m.group(1).strip() if display_m else ""
         group_clean = clean_group(group)
         if group_clean is None:
             continue
+        # 新分组时输出 #genre# 分组行（百川/DIYP 必需，缺了会显示"没有节目源"）
+        if group_clean != current_group:
+            lines.append(f"{group_clean},#genre#")
+            current_group = group_clean
         lines.append(f"{display},{url}")
     return '\n'.join(lines)
 
