@@ -114,6 +114,101 @@ def _probe_ts(ts_url, orig_url):
         return (orig_url, {"height": 0, "note": "ts_fetch_err"})
 
 
+def _fetch_m3u8(url):
+    """拉取 m3u8 内容。失败返回 None。"""
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=ssl_context) as r:
+            return r.read(1048576).decode('utf-8', errors='replace')
+    except Exception:
+        return None
+
+
+def _probe_stream_live(url):
+    """MP4/二进制直出流活性：持续下载 12s 看字节增长。
+    直播=持续增长无 EOF；录像/死=EOF 或极小。返回 (live, note)。"""
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        r = urllib.request.urlopen(req, timeout=TIMEOUT, context=ssl_context)
+        total = 0
+        start = time.time()
+        while time.time() - start < 12:
+            chunk = r.read(65536)
+            if not chunk:
+                return (False, f'eof_after_{total // 1024}KB')
+            total += len(chunk)
+            if total > 5 * 1024 * 1024:
+                return (True, f'streaming_{total // 1024}KB')
+        return (total > 1 * 1024 * 1024, f'{total // 1024}KB')
+    except Exception as e:
+        return (False, str(type(e).__name__)[:15])
+
+
+def check_live(url):
+    """活性检测：区分真直播 vs 录像/死流（2026-08-16 用户反馈 CCTV-4/浙江新闻
+    不是 1080——ffprobe 只能验分辨率，验不了清单是否持续轮转）。
+    判据：两次拉清单（间隔 max(15, TARGETDURATION*2) 秒）——
+      - MEDIA-SEQUENCE 前进 或 分片名变化 → 活流
+      - PROGRAM-DATE-TIME 距今 >7 天 → 死流（录像/冻结，如浙江新闻停在 2023-09）
+      - MP4 直出 → 持续下载字节增长
+    自适应 HLS（STREAM-INF）→ 跟随最高带宽子清单再检测。
+    返回 (live: bool, note: str)。"""
+    c1 = _fetch_m3u8(url)
+    if c1 is None:
+        return (False, 'fetch_fail')
+    # MP4/二进制直出（ftyp/mdat 头）
+    if c1[:4] in ('\x00\x00\x00\x14', 'ftyp') or c1[:4] == '\x00\x00\x00\x18':
+        return _probe_stream_live(url)
+    if '<' in c1[:200] and 'html' in c1[:200].lower():
+        return (False, 'html_page')
+
+    def follow_adaptive(content):
+        if '#EXT-X-STREAM-INF' not in content:
+            return content
+        bands = re.findall(r'#EXT-X-STREAM-INF:[^\n]*BANDWIDTH=(\d+)[^\n]*\n([^\n]+)', content)
+        if not bands:
+            return content
+        sub = max(bands, key=lambda b: int(b[0]))[1].strip()
+        if not sub.startswith('http'):
+            base = url.rsplit('/', 1)[0]
+            sub = f'{base}/{sub}'
+        c = _fetch_m3u8(sub)
+        return c if c is not None else content
+
+    c1 = follow_adaptive(c1)
+    seq1 = re.search(r'#EXT-X-MEDIA-SEQUENCE:(\d+)', c1)
+    ts1 = re.findall(r'^[^#\n].*\.ts', c1, re.M)
+    pdt1 = re.search(r'#EXT-X-PROGRAM-DATE-TIME:([^\n]+)', c1)
+    td = re.search(r'#EXT-X-TARGETDURATION:(\d+)', c1)
+    wait = max(15, (int(td.group(1)) if td else 8) * 2)
+    time.sleep(wait)
+    c2 = _fetch_m3u8(url)
+    if c2 is None:
+        return (False, 'second_fetch_fail')
+    c2 = follow_adaptive(c2)
+    seq2 = re.search(r'#EXT-X-MEDIA-SEQUENCE:(\d+)', c2)
+    ts2 = re.findall(r'^[^#\n].*\.ts', c2, re.M)
+
+    # PDT 陈旧检查：存在且距今 >7 天 → 死流（时间轴错乱/回放循环）
+    if pdt1:
+        try:
+            from datetime import datetime, timezone, timedelta
+            t = datetime.strptime(pdt1.group(1).strip()[:19], '%Y-%m-%dT%H:%M:%S').replace(
+                tzinfo=timezone(timedelta(hours=8)))
+            if (datetime.now(timezone(timedelta(hours=8))) - t).days > 7:
+                return (False, f'pdt_stale {pdt1.group(1).strip()[:16]}')
+        except ValueError:
+            pass
+
+    if seq1 and seq2 and seq2.group(1) != seq1.group(1):
+        return (True, f'seq {seq1.group(1)}->{seq2.group(1)}')
+    if ts1 and ts2 and ts1 != ts2:
+        return (True, 'ts_changed')
+    if not seq1 and not ts1:
+        return (False, 'no_seq_no_ts')
+    return (False, f'frozen {seq1.group(1) if seq1 else "?"}->{seq2.group(1) if seq2 else "?"}')
+
+
 def probe_url(url):
     """Probe a single URL (connect + find M3U8 content)"""
     try:
@@ -123,7 +218,6 @@ def probe_url(url):
             # 只读前 1MB：直播流源（huya/douyu/yy）返回永不结束的视频流，
             # read() 无限读会永久卡死 worker（socket 超时只在无数据时触发）
             content = r.read(1048576).decode('utf-8', errors='replace')
-        
         if '#EXTM3U' in content or '#EXT-X' in content:
             # Find TS segment
             ts_lines = [l for l in content.split('\n') if '.ts' in l and not l.startswith('#')]
@@ -265,11 +359,62 @@ with open(CACHE_FILE, 'w') as f:
 
 signal.alarm(0)  # Cancel global timeout
 
-# Filter ≥1080p (必须 method==ffprobe 实测，防旧缓存假 1080)
+# ══ 活性检测阶段（2026-08-16）：区分真直播 vs 录像/死流 ══
+# ffprobe 只能验分辨率，验不了清单轮转。用户反馈 CCTV-4/浙江新闻「不是 1080」：
+# 实际是死流/录像（清单冻结在 2023/2025 年），分片偶尔可下就被标 1080。
+# 对 ffprobe>=1080 候选做 check_live：无 live 字段（旧缓存）或 7 天过期 → 重测。
+now = time.time()
+hd_cands = [u for u, v in cache.items()
+            if isinstance(v, dict) and v.get('method') == 'ffprobe' and v.get('height', 0) >= 1080
+            and (v.get('live') is None or now - v.get('live_check', 0) > HD_RETEST_TTL)]
+if hd_cands:
+    print(f"\n[LIVE] 活性检测 {len(hd_cands)} 个 HD 候选（清单轮转验证，约 {max(15, TIMEOUT)}s/条）...", flush=True)
+    live_results = {}
+    live_lock = threading.Lock()
+    live_sema = threading.BoundedSemaphore(12)
+
+    def live_worker(url):
+        with live_sema:
+            r = check_live(url)
+        with live_lock:
+            live_results[url] = r
+
+    for u in hd_cands:
+        threading.Thread(target=live_worker, args=(u,), daemon=True).start()
+
+    live_pending = set(hd_cands)
+    live_start = time.time()
+    live_done = 0
+    while live_pending and time.time() - live_start < GLOBAL_TIMEOUT:
+        with live_lock:
+            done = [u for u in live_pending if u in live_results]
+        for u in done:
+            ok, note = live_results[u]
+            cache[u]['live'] = ok
+            cache[u]['live_check'] = time.time()
+            cache[u]['live_note'] = note
+            live_pending.discard(u)
+            live_done += 1
+            print(f"  [LIVE {live_done}/{len(hd_cands)}] {'✅' if ok else '❌'} {note:28s} {u[:55]}", flush=True)
+        if live_pending:
+            time.sleep(1)
+    if live_pending:
+        print(f"  [LIVE] {len(live_pending)} 条超时未完成，按非活流处理", flush=True)
+        for u in live_pending:
+            cache[u]['live'] = False
+            cache[u]['live_check'] = time.time()
+            cache[u]['live_note'] = 'live_check_timeout'
+    with open(CACHE_FILE, 'w') as f:
+        json.dump(cache, f)
+    n_live = sum(1 for u in hd_cands if isinstance(cache.get(u), dict) and cache[u].get('live'))
+    print(f"  [LIVE] 确认活流: {n_live}/{len(hd_cands)}", flush=True)
+
+# Filter ≥1080p (必须 method==ffprobe 实测 + live==True，防旧缓存假 1080 与录像源)
 kept = []
 for extinf, url in entries:
     result = cache.get(url, {})
-    if isinstance(result, dict) and result.get("method") == "ffprobe" and result.get("height", 0) >= 1080:
+    if (isinstance(result, dict) and result.get("method") == "ffprobe" and result.get("height", 0) >= 1080
+            and result.get("live") is True):
         kept.append((extinf, url))
 
 # Deduplicate by channel name
