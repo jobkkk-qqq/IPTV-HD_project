@@ -1,17 +1,37 @@
 #!/usr/bin/env python3
 """Probe IPTV URLs with ffprobe, 15s timeout, mark dead links."""
-import json, re, os, sys, urllib.request, subprocess, concurrent.futures, time
+import json, re, os, sys, urllib.request, subprocess, concurrent.futures, time, signal
 from urllib.parse import urlparse
 from collections import Counter
 
 _BASE = os.environ.get('CACHE_DIR', '/data')
 CACHE_FILE = f'{_BASE}/resolution_cache.json'
-FILTERED_M3U = f'{_BASE}/result.m3u'
-OUTPUT_M3U = f'{_BASE}/result_hd.m3u'
-OUTPUT_TXT = f'{_BASE}/result_hd.txt'
+_SOURCE_M3U = f'{_BASE}/source.m3u'
+_OUTPUT_M3U = f'{_BASE}/result_hd.m3u'
+_OUTPUT_TXT = f'{_BASE}/result_hd.txt'
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"}
-TIMEOUT = 15  # seconds per URL
+TIMEOUT = 6  # seconds per URL (reduced for faster failure)
+GLOBAL_TIMEOUT = 600  # 10 minutes max for entire probe phase
+RETEST_TTL = 48 * 3600   # 死/超时条目 48h 后重新探测（源可能已恢复）
+MAX_RETEST = 100         # 每次 sync 最多重测 100 条过期条目
+
+# Create SSL context that doesn't verify certificates (for internal/carrier URLs)
+import ssl
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+
+_GLOBAL_TIMEOUT_HIT = False
+
+def _timeout_handler(signum, frame):
+    global _GLOBAL_TIMEOUT_HIT
+    _GLOBAL_TIMEOUT_HIT = True
+    print("\n[GLOBAL TIMEOUT] Probe phase exceeded time limit, continuing to save results...", flush=True)
+    # 不退出：设置标志让主循环尽快结束，过滤 + 写入 result_hd.m3u 仍会执行
+
+signal.signal(signal.SIGALRM, _timeout_handler)
+signal.alarm(GLOBAL_TIMEOUT)
 
 # Load cache
 cache = {}
@@ -20,10 +40,10 @@ if os.path.exists(CACHE_FILE):
         cache = json.load(f)
 print(f"Cache loaded: {len(cache)} URLs", flush=True)
 
-# Parse filtered M3U
+# Parse source M3U (not filtered output - probe ALL source URLs)
 entries = []
 cur = None
-with open(FILTERED_M3U, encoding='utf-8') as f:
+with open(_SOURCE_M3U, encoding='utf-8') as f:
     for line in f:
         line = line.rstrip('\r\n')
         if line.startswith('#EXTINF'):
@@ -31,17 +51,31 @@ with open(FILTERED_M3U, encoding='utf-8') as f:
         elif line.startswith('http') and cur:
             entries.append((cur, line))
             cur = None
-print(f"Entries: {len(entries)}", flush=True)
+print(f"Entries from source: {len(entries)}", flush=True)
 
-# Unique uncached URLs
+# Unique uncached URLs + TTL retest of dead/timeout entries
+# 缓存里标记死/超时的条目 48h 后重新探测（源可能已恢复），每次最多重测 MAX_RETEST 条
+now = time.time()
 seen = set()
 to_test = []
+retest = []
 for _, url in entries:
-    if url not in seen:
-        seen.add(url)
-        if url not in cache:
-            to_test.append(url)
-print(f"To probe: {len(to_test)} URLs", flush=True)
+    if url in seen:
+        continue
+    seen.add(url)
+    if url not in cache:
+        to_test.append(url)
+        continue
+    rec = cache[url]
+    if isinstance(rec, dict) and rec.get('method') in ('timeout', 'http_err', 'error', 'redirect'):
+        if not rec.get('last_probe'):
+            rec['last_probe'] = 1  # 旧记录无时间戳 → 视为最旧，优先重测
+        if now - rec.get('last_probe', 0) > RETEST_TTL:
+            retest.append(url)
+# 按最旧优先，最多 MAX_RETEST 条
+retest.sort(key=lambda u: cache[u].get('last_probe', 0))
+to_test.extend(retest[:MAX_RETEST])
+print(f"To probe: {len(to_test)} URLs (new={len(to_test)-min(len(retest),MAX_RETEST)}, expired-retest={min(len(retest),MAX_RETEST)}/{len(retest)})", flush=True)
 
 def _probe_ts(ts_url, orig_url):
     """Download a TS segment and ffprobe its real resolution. Returns (orig_url, result)."""
@@ -68,7 +102,8 @@ def _probe_ts(ts_url, orig_url):
         for s in info.get('streams', []):
             if s.get('codec_type') == 'video':
                 h, w = s.get('height', 0), s.get('width', 0)
-                return (orig_url, {"height": h, "width": w, "note": f"{w}x{h}"})
+                # method=ffprobe 必须写：kept 过滤只认 ffprobe 实测，缺字段会被丢弃
+                return (orig_url, {"height": h, "width": w, "method": "ffprobe", "note": f"{w}x{h}"})
         return (orig_url, {"height": 0, "note": "no_video_stream"})
     except Exception:
         return (orig_url, {"height": 0, "note": "ts_fetch_err"})
@@ -78,8 +113,11 @@ def probe_url(url):
     """Probe a single URL (connect + find M3U8 content)"""
     try:
         req = urllib.request.Request(url, headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            content = r.read().decode('utf-8', errors='replace')
+        # Use SSL context to bypass certificate verification
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=ssl_context) as r:
+            # 只读前 1MB：直播流源（huya/douyu/yy）返回永不结束的视频流，
+            # read() 无限读会永久卡死 worker（socket 超时只在无数据时触发）
+            content = r.read(1048576).decode('utf-8', errors='replace')
         
         if '#EXTM3U' in content or '#EXT-X' in content:
             # Find TS segment
@@ -95,19 +133,21 @@ def probe_url(url):
                         sub_url = f"{base}/{sub_url}"
                     try:
                         req3 = urllib.request.Request(sub_url, headers=HEADERS)
-                        with urllib.request.urlopen(req3, timeout=TIMEOUT) as r3:
-                            sub_content = r3.read().decode('utf-8', errors='replace')
+                        with urllib.request.urlopen(req3, timeout=TIMEOUT, context=ssl_context) as r3:
+                            sub_content = r3.read(1048576).decode('utf-8', errors='replace')
                         sub_ts = [l for l in sub_content.split('\n') if '.ts' in l and not l.startswith('#')]
                         if sub_ts:
                             ts_url = sub_ts[0].strip()
                             if not ts_url.startswith('http'):
                                 sub_base = sub_url.rsplit('/', 1)[0]
                                 ts_url = f"{sub_base}/{ts_url}"
-                            return _probe_ts(ts_url, url)
+                            _, ts_result = _probe_ts(ts_url, url)
+                            return ts_result
                         # variant playlist may have resolution in #EXT-X-STREAM-INF
                         m = re.search(r'#EXT-X-STREAM-INF:[^\n]*RESOLUTION=(\d+)x(\d+)', sub_content)
                         if m:
                             return (url, {"height": int(m.group(2)), "width": int(m.group(1)),
+                                          "method": "ffprobe",  # 清单声明，note 前缀 adaptive_ 可追溯
                                           "note": f"adaptive_{m.group(1)}x{m.group(2)}"})
                         return (url, {"height": 0, "note": "adaptive_no_ts"})
                     except Exception:
@@ -119,45 +159,106 @@ def probe_url(url):
             base = url.rsplit('/', 1)[0]
             if '?' in base: base = base.split('?')[0]
             ts_url = f"{base}/{ts_rel}" if not ts_rel.startswith('http') else ts_rel
-            return _probe_ts(ts_url, url)
+            _, ts_result = _probe_ts(ts_url, url)
+            return ts_result
         else:
-            return (url, {"height": 0, "note": "not_hls"})
+            return {"height": 0, "note": "not_hls"}
     except urllib.error.HTTPError as e:
         code = e.code
         if code in (301, 302, 303, 307, 308):
-            return (url, {"height": 0, "note": f"redirect_{code}"})
-        return (url, {"height": 0, "note": f"HTTP{code}"})
-    except urllib.error.URLError:
-        return (url, {"height": 0, "note": "timeout"})
+            return (url, {"height": 0, "method": "redirect", "note": f"redirect_{code}"})
+        return (url, {"height": 0, "method": "http_err", "note": f"HTTP{code}"})
+    except urllib.error.URLError as e:
+        reason = str(e.reason)
+        if "timeout" in reason.lower() or "timed out" in reason.lower():
+            return (url, {"height": 0, "method": "timeout", "note": "timeout"})
+        return (url, {"height": 0, "method": "error", "note": reason[:30]})
     except Exception as ex:
-        return (url, {"height": 0, "note": str(type(ex).__name__)[:15]})
+        return (url, {"height": 0, "method": "error", "note": str(type(ex).__name__)[:15]})
 
 hd_found = 0
 dead = 0
-with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-    futures = {ex.submit(probe_url, url): url for url in to_test}
-    for i, future in enumerate(concurrent.futures.as_completed(futures)):
-        url, result = future.result()
-        cache[url] = result
-        
-        if result["height"] >= 1080:
-            hd_found += 1
-            sys.stdout.write(f"  [{i+1}/{len(to_test)}] ✅ {result['note']:15s} {url[:60]}\n")
-        else:
-            dead += 1
-            if result["note"] not in ("domain_unreachable",):
-                sys.stdout.write(f"  [{i+1}/{len(to_test)}] ❌ {result['note']:15s} {url[:60]}\n")
-        
-        sys.stdout.flush()
-        
-        # Save cache every 20 results
-        if (i+1) % 20 == 0:
-            with open(CACHE_FILE, 'w') as f:
-                json.dump(cache, f)
+probed = 0
+start_time = time.time()
+
+# 调度：daemon 线程 + 信号量限并发 + 看门狗
+# ThreadPoolExecutor 的固定 worker 会被卡死的 URL 永久占用（如直播流源），
+# 改用 daemon 线程：卡死的线程成孤儿不影响主流程，看门狗强制标记 timeout
+import threading
+
+WATCHDOG = TIMEOUT * 3 + 5  # 23s：单 URL 超过此时间未返回 → 强制标记超时
+
+results = {}
+results_lock = threading.Lock()
+submitted = {}
+concurrency = threading.BoundedSemaphore(16)
+
+def probe_worker(url):
+    try:
+        with concurrency:
+            r = probe_url(url)
+    except Exception:
+        r = {"height": 0, "method": "error", "note": "worker_exc"}
+    # probe_url 的 adaptive HLS 分支直接 return _probe_ts() 的 (url, result) tuple
+    if isinstance(r, tuple):
+        _, r = r
+    with results_lock:
+        results[url] = r
+
+for url in to_test:
+    submitted[url] = time.time()
+    threading.Thread(target=probe_worker, args=(url,), daemon=True).start()
+
+def process_result(url, result):
+    """输出 + 缓存 + 定期保存（从主循环提取，供正常完成与看门狗共用）"""
+    global probed, hd_found, dead
+    result['last_probe'] = time.time()
+    cache[url] = result
+    probed += 1
+
+    if result["height"] >= 1080:
+        hd_found += 1
+        sys.stdout.write(f"  [{probed}/{len(to_test)}] ✅ {result.get('note',''):15s} {url[:60]}\n")
+    else:
+        dead += 1
+        note = result.get('note', 'unknown')
+        if note not in ("domain_unreachable",):
+            sys.stdout.write(f"  [{probed}/{len(to_test)}] ❌ {note:15s} {url[:60]}\n")
+
+    sys.stdout.flush()
+
+    if probed % 10 == 0:
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(cache, f)
+        print(f"  [progress] Cache saved at {probed} URLs ({int(time.time()-start_time)}s elapsed)", flush=True)
+
+pending = set(to_test)
+try:
+    while pending and not _GLOBAL_TIMEOUT_HIT and time.time() - start_time < GLOBAL_TIMEOUT:
+        # 收集已完成
+        with results_lock:
+            done = [u for u in pending if u in results]
+        for url in done:
+            process_result(url, results[url])
+            pending.discard(url)
+        # 看门狗：卡死线程的 URL 强制超时
+        now = time.time()
+        for url in list(pending):
+            if now - submitted[url] > WATCHDOG:
+                process_result(url, {"height": 0, "method": "timeout", "note": "watchdog"})
+                pending.discard(url)
+        if pending:
+            time.sleep(1)
+    if pending:
+        print(f"\n[TIMEOUT] Stopping after {probed} URLs probed ({int(time.time()-start_time)}s), {len(pending)} pending", flush=True)
+finally:
+    pass  # daemon 线程自生自灭，无需 join
 
 # Final save
 with open(CACHE_FILE, 'w') as f:
     json.dump(cache, f)
+
+signal.alarm(0)  # Cancel global timeout
 
 # Filter ≥1080p (必须 method==ffprobe 实测，防旧缓存假 1080)
 kept = []
@@ -177,13 +278,13 @@ for extinf, url in kept:
         deduped.append((extinf, url))
 
 # Write M3U
-with open(OUTPUT_M3U, 'w', encoding='utf-8') as f:
+with open(_OUTPUT_M3U, 'w', encoding='utf-8') as f:
     f.write('#EXTM3U\n#PLAYLIST: IPTV 1080P+ (ffprobe-verified)\n')
     for extinf, url in deduped:
         f.write(extinf + '\n' + url + '\n')
 
 # Write TXT grouped
-with open(OUTPUT_TXT, 'w', encoding='utf-8') as f:
+with open(_OUTPUT_TXT, 'w', encoding='utf-8') as f:
     cg = None
     for extinf, url in deduped:
         g = re.search(r'group-title="([^"]+)"', extinf)
@@ -204,7 +305,7 @@ print(f"Reachable: {total_reachable}", flush=True)
 print(f"Dead/timeout: {len(cache) - total_reachable}", flush=True)
 print(f"≥1080p URLs: {total_hd}", flush=True)
 print(f"Kept channels: {len(deduped)}", flush=True)
-print(f"Saved: {OUTPUT_M3U}", flush=True)
+print(f"Saved: {_OUTPUT_M3U}", flush=True)
 
 # Groups
 groups = Counter()
