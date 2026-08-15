@@ -11,9 +11,10 @@ _OUTPUT_M3U = f'{_BASE}/result_hd.m3u'
 _OUTPUT_TXT = f'{_BASE}/result_hd.txt'
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"}
-TIMEOUT = 6  # seconds per URL (reduced for faster failure)
-GLOBAL_TIMEOUT = 600  # 10 minutes max for entire probe phase
+TIMEOUT = 20  # seconds per URL — 用户定标准：>20s 响应的源即使 1080 也没观看价值（电视会卡/频繁缓冲），跳过
+GLOBAL_TIMEOUT = 900  # 15 minutes max for entire probe phase
 RETEST_TTL = 48 * 3600   # 死/超时条目 48h 后重新探测（源可能已恢复）
+HD_RETEST_TTL = 7 * 24 * 3600  # ffprobe 成功条目 7 天后重新探测（源会漂移，如 gslb 302 到标清档，防止假 1080 永驻）
 MAX_RETEST = 100         # 每次 sync 最多重测 100 条过期条目
 
 # Create SSL context that doesn't verify certificates (for internal/carrier URLs)
@@ -67,10 +68,14 @@ for _, url in entries:
         to_test.append(url)
         continue
     rec = cache[url]
-    if isinstance(rec, dict) and rec.get('method') in ('timeout', 'http_err', 'error', 'redirect'):
+    if isinstance(rec, dict):
+        # 所有记录都按时间戳进 TTL 重测：ffprobe 成功 7 天，失败/死链 48h。
+        # 修复前 ffprobe 成功记录永不重测 → 源漂移后假 1080 永驻（2026-08-15 CCTV-4 教训：
+        # cctv4hd 302 到 cctv4md 720p 档，缓存却写 1920x1080）
+        ttl = HD_RETEST_TTL if rec.get('method') == 'ffprobe' else RETEST_TTL
         if not rec.get('last_probe'):
             rec['last_probe'] = 1  # 旧记录无时间戳 → 视为最旧，优先重测
-        if now - rec.get('last_probe', 0) > RETEST_TTL:
+        if now - rec.get('last_probe', 0) > ttl:
             retest.append(url)
 # 按最旧优先，最多 MAX_RETEST 条
 retest.sort(key=lambda u: cache[u].get('last_probe', 0))

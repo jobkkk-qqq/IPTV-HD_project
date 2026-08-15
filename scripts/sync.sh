@@ -38,7 +38,7 @@ echo "[2/4] Backing up source (result.m3u untouched)..." | tee -a "$LOG"
 cp "${CACHE_DIR}/source.m3u" "${CACHE_DIR}/source.bak"
 
 # Step 3: ffprobe HD detection
-echo "[3/4] ffprobe resolution check (parallel, 15s timeout)..." | tee -a "$LOG"
+echo "[3/4] ffprobe resolution check (parallel, 20s timeout)..." | tee -a "$LOG"
 set +e
 CACHE_DIR="$CACHE_DIR" python3 /scripts/probe_hd.py 2>&1 | tee -a "$LOG"
 PROBE_RC=${PIPESTATUS[0]}
