@@ -18,20 +18,36 @@ LOG="${CACHE_DIR}/sync-hd.log"
 echo "=== IPTV HD Sync $(date '+%Y-%m-%d %H:%M:%S') ===" | tee -a "$LOG"
 
 # Step 1: Download source
+# 国内直连 raw.githubusercontent 经常超时（2026-09 实测：容器内 60s 读超时），
+# 故按 gh-proxy → jsDelivr → 直连 的顺序多通道尝试，第一个成功即用。
 echo "[1/4] Downloading source..." | tee -a "$LOG"
 python3 -c "
 import urllib.request, sys
-url = '${UPSTREAM_BASE}/result.m3u'
-out = '${CACHE_DIR}/source.m3u'
-try:
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        with open(out, 'wb') as f:
-            f.write(r.read())
-    print('  Downloaded')
-except Exception as e:
-    print(f'  ERROR: {e}', flush=True)
-    sys.exit(1)
+GH = '${UPSTREAM_BASE}/result.m3u'
+MIRRORS = [
+    ('gh-proxy', 'https://gh-proxy.com/' + GH),                                # 实时透传，实测 2.5s
+    ('jsDelivr', 'https://cdn.jsdelivr.net/gh/Guovin/iptv-api@gd/output/result.m3u'),  # 最快 0.5s，但有 CDN 缓存
+    ('direct', GH),
+]
+last_err = 'n/a'
+for name, url in MIRRORS:
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = r.read()
+        if data.count(b'#EXTINF') < 100:
+            last_err = name + ': too few entries (' + str(data.count(b'#EXTINF')) + ')'
+            print('  ' + last_err + ' - trying next...', flush=True)
+            continue
+        with open('${CACHE_DIR}/source.m3u', 'wb') as f:
+            f.write(data)
+        print('  Downloaded via ' + name + ' (' + str(len(data)//1024) + 'KB)', flush=True)
+        sys.exit(0)
+    except Exception as e:
+        last_err = name + ': ' + type(e).__name__ + ': ' + str(e)
+        print('  ' + last_err + ' - trying next...', flush=True)
+print('  ERROR: all mirrors failed. last=' + last_err, flush=True)
+sys.exit(1)
 " 2>&1 | tee -a "$LOG"
 
 SRC=$(grep -c "#EXTINF" "${CACHE_DIR}/source.m3u" 2>/dev/null || echo 0)
