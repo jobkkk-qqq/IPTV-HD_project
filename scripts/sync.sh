@@ -75,6 +75,24 @@ python3 /scripts/iptv_format.py \
   "${CACHE_DIR}/result.m3u" \
   "${CACHE_DIR}/result.txt" 2>&1 | tee -a "$LOG"
 
+# Step 4.5: 防退化保护 —— 新结果骤减时保留上一份列表
+# 背景（2026-09-19）：清空 ffprobe 缓存后全量重测，1547/1551 源不可达，
+# 列表从 88 个频道直接跌到 2 个。IPTV 源集体失效、或探测环境异常（网络/NAT）时，
+# 宁可保留一份还能用的旧列表，也不能把它清空 —— 播放器那边会直接变砖。
+NEW_CNT=$(grep -c "#EXTINF" "${CACHE_DIR}/result.m3u" 2>/dev/null || echo 0)
+if [ -f "${CACHE_DIR}/result.m3u.lastknown" ]; then
+    OLD_CNT=$(grep -c "#EXTINF" "${CACHE_DIR}/result.m3u.lastknown" 2>/dev/null || echo 0)
+    if [ "$OLD_CNT" -ge 20 ] && [ "$NEW_CNT" -lt $((OLD_CNT / 2)) ]; then
+        echo "  [GUARD] 结果骤减 ${OLD_CNT} -> ${NEW_CNT} 频道，判定为源集体不可达，保留上一份列表" | tee -a "$LOG"
+        cp "${CACHE_DIR}/result.m3u.lastknown" "${CACHE_DIR}/result.m3u"
+        [ -f "${CACHE_DIR}/result_hd.m3u.lastknown" ] && cp "${CACHE_DIR}/result_hd.m3u.lastknown" "${CACHE_DIR}/result_hd.m3u"
+        NEW_CNT=$OLD_CNT
+    fi
+fi
+# 记录本次结果供下次比较（只有扛过保护的才成为新的基线）
+cp "${CACHE_DIR}/result.m3u" "${CACHE_DIR}/result.m3u.lastknown" 2>/dev/null || true
+[ -f "${CACHE_DIR}/result_hd.m3u" ] && cp "${CACHE_DIR}/result_hd.m3u" "${CACHE_DIR}/result_hd.m3u.lastknown" 2>/dev/null || true
+
 # Step 5: EPG（节目单）—— 供本服务 /epg.xml 端点使用
 # 先落到临时文件，转换成功才覆盖正式文件，避免下载/转换失败把可用数据清空
 echo "[EPG] Updating epg.xml ..." | tee -a "$LOG"
