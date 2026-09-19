@@ -12,3 +12,6 @@ tested_urls.json
 # 系统
 .DS_Store
 Thumbs.db
+
+# 本地扩展（本机特有的第三方源整合，不进仓库）
+docker/merged_local.py
