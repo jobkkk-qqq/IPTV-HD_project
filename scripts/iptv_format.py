@@ -72,9 +72,13 @@ GROUP_MAP = {
 }
 
 # 3566 同款文件头
+# EPG 地址：默认走本服务的公网域名（本机 /epg.xml 由 sync.sh 定期更新），
+# 好处是播放器不依赖被墙的 raw.githubusercontent 或会限流的第三方代理。
+# 内网想直连可设 IPTV_EPG_URL=http://192.168.1.111:3568/epg.xml
+EPG_URL = os.environ.get("IPTV_EPG_URL", "https://hdtv.jobx.dpdns.org/epg.xml")
 M3U_HEADER = (
     '#EXTM3U '
-    f'x-tvg-url="http://{SERVER_IP}:{PORT}/playback.xml" '
+    f'x-tvg-url="{EPG_URL}" '
     'catchup="append" '
     'catchup-source="?playbackbegin=${(b)yyyyMMddHHmmss}&playbackend=${(e)yyyyMMddHHmmss}"'
 )

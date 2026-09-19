@@ -54,6 +54,28 @@ python3 /scripts/iptv_format.py \
   "${CACHE_DIR}/result.m3u" \
   "${CACHE_DIR}/result.txt" 2>&1 | tee -a "$LOG"
 
+# Step 5: EPG（节目单）—— 供本服务 /epg.xml 端点使用
+# 播放器因此只需访问本域名，不必直连被墙的 raw.githubusercontent 或会限流的代理
+echo "[EPG] Updating epg.xml ..." | tee -a "$LOG"
+python3 -c "
+import urllib.request
+for name in ('epg.xml', 'epg.gz'):
+    url = '${UPSTREAM_BASE}/epg/' + name
+    out = '${CACHE_DIR}/' + name
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = r.read()
+        if len(data) < 10000:
+            print(f'  {name}: too small ({len(data)}B) - kept old')
+            continue
+        with open(out, 'wb') as f:
+            f.write(data)
+        print(f'  {name}: {len(data)//1024} KB OK')
+    except Exception as e:
+        print(f'  {name}: ERROR {e} - kept old')
+" 2>&1 | tee -a "$LOG"
+
 # Staleness check: result_hd.m3u 超过 3 天未更新 → 告警
 HD_TS=$(stat -c %Y "${CACHE_DIR}/result_hd.m3u" 2>/dev/null || echo 0)
 NOW_TS=$(date +%s)

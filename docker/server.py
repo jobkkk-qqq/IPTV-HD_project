@@ -20,13 +20,22 @@ class CacheHandler(http.server.BaseHTTPRequestHandler):
             "/result.m3u": "result.m3u",
             "/tv.txt": "result.txt",
             "/tv.m3u": "result.m3u",
+            "/epg.xml": "epg.xml",       # EPG（XMLTV）—— sync.sh 定期更新；省去播放器直连被墙的源
+            "/epg.gz": "epg.gz",         # 压缩版（省流量；播放器需支持 gzip EPG）
         }
         
         filename = file_map.get(path)
         if filename:
             filepath = os.path.join(CACHE_DIR, filename)
             if os.path.exists(filepath):
-                content_type = "audio/x-mpegurl; charset=utf-8" if filename.endswith(".m3u") else "text/plain; charset=utf-8"
+                if filename.endswith(".m3u"):
+                    content_type = "audio/x-mpegurl; charset=utf-8"
+                elif filename.endswith(".xml"):
+                    content_type = "application/xml; charset=utf-8"
+                elif filename.endswith(".gz"):
+                    content_type = "application/gzip"
+                else:
+                    content_type = "text/plain; charset=utf-8"
                 with open(filepath, "rb") as f:
                     content = f.read()
                 self.send_response(200)
