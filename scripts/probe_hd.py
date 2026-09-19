@@ -12,7 +12,8 @@ _OUTPUT_TXT = f'{_BASE}/result_hd.txt'
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"}
 TIMEOUT = 20  # seconds per URL — 用户定标准：>20s 响应的源即使 1080 也没观看价值（电视会卡/频繁缓冲），跳过
-GLOBAL_TIMEOUT = 900  # 15 minutes max for entire probe phase
+GLOBAL_TIMEOUT = 2700  # 45 min：并发降到 6 后，单轮全量（1551 源）约需 15-20 min，留足余量
+# 2026-09-19：原 900s（15 min）是为 16 并发配的，降并发后必须同步放宽，否则跑不完
 RETEST_TTL = 48 * 3600   # 死/超时条目 48h 后重新探测（源可能已恢复）
 HD_RETEST_TTL = 7 * 24 * 3600  # ffprobe 成功条目 7 天后重新探测（源会漂移，如 gslb 302 到标清档，防止假 1080 永驻）
 MAX_RETEST = 100         # 每次 sync 最多重测 100 条过期条目
@@ -285,27 +286,52 @@ start_time = time.time()
 # 改用 daemon 线程：卡死的线程成孤儿不影响主流程，看门狗强制标记 timeout
 import threading
 
-WATCHDOG = TIMEOUT * 3 + 5  # 23s：单 URL 超过此时间未返回 → 强制标记超时
+WATCHDOG = 45  # 单 URL 超过此时间未返回 → 强制标记超时
+# 2026-09-19 从 23s（TIMEOUT*3+5）放宽到 45s：抽样实测慢源最慢 15.7s 才出画面，
+# 23s 在 16 并发抢通道的情况下会把大量可用源误杀成本死。
 
 results = {}
 results_lock = threading.Lock()
 submitted = {}
-concurrency = threading.BoundedSemaphore(16)
+# 2026-09-19 从 16 降到 6：16 并发会把家用出口的 NAT 连接表/带宽打爆，
+# 导致大量可用源被判不可达（实测全量探测 1551 源只剩 4 个"可达"，
+# 而单线程抽样实测可用率 83% —— 差异全是并发自伤造成的误判）。
+concurrency = threading.BoundedSemaphore(6)
+
+PROBE_RETRY = 1        # 失败后重试次数
+PROBE_RETRY_DELAY = 3  # 重试前等待秒数 —— 滤掉网络抖动造成的误杀
+# 只对"网络敏感型"失败重试；域名不存在 / HTTP404 这类确定性失败不浪费重试额度
+RETRYABLE_NOTES = ("timeout", "ts_fetch_err", "watchdog", "worker_exc", "ts_too_small")
 
 def probe_worker(url):
-    try:
-        with concurrency:
-            r = probe_url(url)
-    except Exception:
-        r = {"height": 0, "method": "error", "note": "worker_exc"}
-    # probe_url 的 adaptive HLS 分支直接 return _probe_ts() 的 (url, result) tuple
-    if isinstance(r, tuple):
-        _, r = r
+    r = None
+    for attempt in range(PROBE_RETRY + 1):
+        try:
+            with concurrency:
+                # 关键修复（2026-09-19 事故根因）：submitted 必须在**真正开始探测**时打点。
+                # 原先在主循环"提交线程"时打点，于是排队等待时间也计入看门狗 ——
+                # 1551 个线程同时启动、只有 N 个能拿到信号量，其余排在队里 23s 就被判
+                # watchdog 失败，导致 1547/1551 个可用源被误杀（列表 88 → 2）。
+                submitted[url] = time.time()
+                r = probe_url(url)
+        except Exception:
+            r = {"height": 0, "method": "error", "note": "worker_exc"}
+        # probe_url 的 adaptive HLS 分支直接 return _probe_ts() 的 (url, result) tuple
+        if isinstance(r, tuple):
+            _, r = r
+        if r.get("height", 0) >= 1080:
+            break                       # 已确认真 1080p，无需重试
+        if r.get("note") not in RETRYABLE_NOTES:
+            break                       # 确定性失败（域名解析失败、404 等），重试没意义
+        if attempt < PROBE_RETRY:
+            time.sleep(PROBE_RETRY_DELAY)
     with results_lock:
         results[url] = r
 
 for url in to_test:
-    submitted[url] = time.time()
+    # 注意：这里**不要**给 submitted[url] 打点！
+    # 否则排队等待时间会被看门狗算成"探测超时"（2026-09-19 事故根因）。
+    # submitted 只由 probe_worker 在真正拿到并发槽、开始探测时写入。
     threading.Thread(target=probe_worker, args=(url,), daemon=True).start()
 
 def process_result(url, result):
@@ -343,7 +369,9 @@ try:
         # 看门狗：卡死线程的 URL 强制超时
         now = time.time()
         for url in list(pending):
-            if now - submitted[url] > WATCHDOG:
+            # 只在"已经开始探测"的 URL 上计时：还没拿到并发槽的 URL 仍在排队，
+            # 排队时间不算超时（否则大批源会被误判 watchdog）。
+            if url in submitted and now - submitted[url] > WATCHDOG:
                 process_result(url, {"height": 0, "method": "timeout", "note": "watchdog"})
                 pending.discard(url)
         if pending:
@@ -371,7 +399,7 @@ if hd_cands:
     print(f"\n[LIVE] 活性检测 {len(hd_cands)} 个 HD 候选（清单轮转验证，约 {max(15, TIMEOUT)}s/条）...", flush=True)
     live_results = {}
     live_lock = threading.Lock()
-    live_sema = threading.BoundedSemaphore(12)
+    live_sema = threading.BoundedSemaphore(6)   # 2026-09-19 从 12 降到 6，与探测阶段一致，避免并发自伤
 
     def live_worker(url):
         with live_sema:
